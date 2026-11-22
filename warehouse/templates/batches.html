@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}批次档案 · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>批次档案</h1>
+<p class="hint">每次上传的原件按字节保存，可随时下载核对。改选模板只改变解析方式，不改变原件。</p>
+
+{% if batches %}
+  <table>
+    <thead>
+      <tr><th>批次</th><th>文件名</th><th>当前模板</th><th>原始模板</th><th>申报数</th><th>大小</th><th>上传时间</th></tr>
+    </thead>
+    <tbody>
+    {% for b in batches %}
+      <tr>
+        <td><a href="{{ url_for('main.batch_detail', batch_id=b.id) }}">#{{ b.id }}</a></td>
+        <td>{{ b.filename }}</td>
+        <td>{{ b.current_template_name }}</td>
+        <td>{{ b.original_template_name }}
+          {% if b.template_id != b.original_template_id %}<span class="tag">已改选</span>{% endif %}
+        </td>
+        <td>{{ b.declaration_count }}</td>
+        <td>{{ (b.size_bytes / 1024) | round(1) }} KB</td>
+        <td>{{ b.uploaded_at | dt }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="muted">还没有上传过批次。</p>
+{% endif %}
+{% endblock %}

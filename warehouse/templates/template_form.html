@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}登记模板 · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>登记报告模板</h1>
+
+{% if errors %}
+  <ul class="errors">
+    {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+{% endif %}
+{% if not indicators %}
+  <p class="hint">还没有登记任何指标，请先到 <a href="{{ url_for('main.indicators') }}">指标字典</a> 登记。</p>
+{% endif %}
+
+<form method="post" action="{{ url_for('main.create_template') }}" class="panel stack">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <label>模板名称
+    <input name="name" required maxlength="120" value="{{ form.get('name', '') }}"
+           placeholder="如 常规抗压报告">
+  </label>
+  <label>试件号列名
+    <input name="specimen_header" required maxlength="120" value="{{ form.get('specimen_header', '') }}"
+           placeholder="如 试件编号">
+  </label>
+  <label>报告修订号列名
+    <input name="revision_header" required maxlength="120" value="{{ form.get('revision_header', '') }}"
+           placeholder="如 报告修订号">
+  </label>
+
+  <h2>指标列对照</h2>
+  <p class="hint">CSV 列名可以重复出现在不同模板中（指向不同指标），但同一模板内每个指标只能对应一列。</p>
+  <div id="mapping-rows" class="mapping-rows">
+    {% for row in mapping %}
+      <div class="mapping-row">
+        <input name="header" maxlength="120" placeholder="CSV 列名，如 强度" value="{{ row.header }}">
+        <select name="indicator_id">
+          <option value="">— 选择指标 —</option>
+          {% for i in indicators %}
+            <option value="{{ i.id }}" {% if row.indicator_id|string == i.id|string %}selected{% endif %}>
+              {{ i.name }}（{{ i.code }}）
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+    {% endfor %}
+  </div>
+  <p><button type="button" class="secondary" id="add-row">再加一列</button></p>
+  <button type="submit" {% if not indicators %}disabled{% endif %}>登记模板</button>
+</form>
+
+<template id="mapping-row-template">
+  <div class="mapping-row">
+    <input name="header" maxlength="120" placeholder="CSV 列名，如 强度">
+    <select name="indicator_id">
+      <option value="">— 选择指标 —</option>
+      {% for i in indicators %}
+        <option value="{{ i.id }}">{{ i.name }}（{{ i.code }}）</option>
+      {% endfor %}
+    </select>
+  </div>
+</template>
+<script>
+  document.getElementById('add-row').addEventListener('click', function () {
+    var tpl = document.getElementById('mapping-row-template');
+    document.getElementById('mapping-rows').appendChild(tpl.content.cloneNode(true));
+  });
+</script>
+{% endblock %}

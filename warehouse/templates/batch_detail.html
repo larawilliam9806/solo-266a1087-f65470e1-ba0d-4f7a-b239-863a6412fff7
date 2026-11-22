@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}批次 #{{ batch.id }} · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>批次 #{{ batch.id }}：{{ batch.filename }}</h1>
+
+{% if errors %}
+  <ul class="errors">
+    {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+{% endif %}
+
+<section class="panel">
+  <h2>档案信息</h2>
+  <dl class="facts">
+    <dt>当前模板</dt><dd>{{ batch.current_template_name }}</dd>
+    <dt>原始模板</dt><dd>{{ batch.original_template_name }}
+      {% if batch.template_id != batch.original_template_id %}
+        <span class="tag">已改选于 {{ batch.template_changed_at | dt }}</span>
+      {% endif %}
+    </dd>
+    <dt>上传时间</dt><dd>{{ batch.uploaded_at | dt }}</dd>
+    <dt>文件大小</dt><dd>{{ batch.size_bytes }} 字节</dd>
+    <dt>SHA-256</dt><dd><code class="break">{{ batch.content_sha256 }}</code></dd>
+    <dt>原件</dt><dd><a href="{{ url_for('main.batch_download', batch_id=batch.id) }}">下载原始 CSV</a>
+      <span class="muted">（原始字节，不随模板改选变化）</span></dd>
+  </dl>
+</section>
+
+{% if notes.warnings %}
+<section class="panel">
+  <h2>解析提示</h2>
+  <ul class="plain">
+    {% for w in notes.warnings %}<li>{{ w }}</li>{% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>改选模板</h2>
+  <p class="hint">若本批次上传时选错了模板，可在此改选。系统会用新模板重新解释原件：
+    原先按旧模板得到的申报被替换；失去所有申报的指标会从底表撤下。
+    若改选后与其它批次在同一试件、指标、修订号上出现不同值，改选会被整体拒绝。</p>
+  <form method="post" action="{{ url_for('main.batch_switch', batch_id=batch.id) }}" class="inline">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <select name="template_id" required>
+      {% for t in templates %}
+        <option value="{{ t.id }}" {% if t.id == batch.template_id %}selected{% endif %}>{{ t.name }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">按新模板重新取值</button>
+  </form>
+</section>
+
+<section class="panel">
+  <h2>模板改选记录</h2>
+  {% if changes %}
+    <ul class="plain">
+      {% for c in changes %}
+        <li>{{ c.changed_at | dt }}：{{ c.from_name }} → {{ c.to_name }}</li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">该批次未改选过模板。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>本批次申报明细（按当前模板解释）</h2>
+  {% if declarations %}
+    <table>
+      <thead><tr><th>试件</th><th>指标</th><th>修订号</th><th>申报值 (MPa)</th><th>文件行号</th></tr></thead>
+      <tbody>
+      {% for d in declarations %}
+        <tr>
+          <td><a href="{{ url_for('main.specimen_detail', specimen_id=d.specimen_id) }}">{{ d.specimen_number }}</a></td>
+          <td>{{ d.indicator_name }}（{{ d.code }}）</td>
+          <td>{{ d.revision_raw or d.revision }}</td>
+          <td>{{ d.value_micro | micro }}</td>
+          <td>{{ d.row_number }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">按当前模板，该批次没有申报任何指标。</p>
+  {% endif %}
+  {% if notes.absent_indicators %}
+    <p class="hint">本文件未带的指标列（本批次不申报；底表对这些指标按其它批次的既有申报取值）：
+      {% for i in notes.absent_indicators %}{{ i.name }}（{{ i.code }}）{% if not loop.last %}、{% endif %}{% endfor %}
+    </p>
+  {% endif %}
+</section>
+{% endblock %}

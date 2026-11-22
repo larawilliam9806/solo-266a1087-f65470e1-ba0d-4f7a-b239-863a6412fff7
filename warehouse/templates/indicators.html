@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}指标字典 · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>指标字典</h1>
+<p class="hint">指标与模板列名解耦：同一个列名「强度」在不同模板中可分别指向
+  实测强度、折算强度等不同指标。CSV 中的列必须先在本字典登记，再挂到模板上。</p>
+
+{% if errors %}
+  <ul class="errors">
+    {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+{% endif %}
+
+<section class="panel">
+  <h2>已登记指标</h2>
+  {% if indicators %}
+    <table>
+      <thead><tr><th>编码</th><th>名称</th><th>单位</th><th>说明</th><th>引用模板数</th></tr></thead>
+      <tbody>
+      {% for i in indicators %}
+        <tr>
+          <td><code>{{ i.code }}</code></td>
+          <td>{{ i.name }}</td>
+          <td>{{ i.unit }}</td>
+          <td class="muted">{{ i.description or "—" }}</td>
+          <td>{{ i.template_count }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">尚未登记指标。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>登记新指标</h2>
+  <form method="post" action="{{ url_for('main.create_indicator') }}" class="stack">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <label>指标编码
+      <input name="code" required maxlength="64" value="{{ form.get('code', '') }}"
+             placeholder="如 STRENGTH_MEASURED">
+    </label>
+    <label>指标名称
+      <input name="name" required maxlength="120" value="{{ form.get('name', '') }}"
+             placeholder="如 抗压强度（实测）">
+    </label>
+    <label>说明
+      <input name="description" maxlength="255" value="{{ form.get('description', '') }}">
+    </label>
+    <p class="hint">单位固定为 MPa。</p>
+    <button type="submit">登记指标</button>
+  </form>
+</section>
+{% endblock %}

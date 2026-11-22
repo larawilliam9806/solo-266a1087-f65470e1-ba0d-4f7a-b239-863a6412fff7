@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}报告模板 · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>报告模板</h1>
+<p class="hint">模板登记了 CSV 的列名与仓库指标的对照关系。同名「强度」列在不同模板中可以
+  指向不同指标，因此上传时必须选对模板。</p>
+<p><a class="button" href="{{ url_for('main.new_template') }}">登记新模板</a></p>
+
+{% for t in templates %}
+  <section class="panel">
+    <h2>{{ t.name }}</h2>
+    <p class="muted">试件号列「{{ t.specimen_header }}」· 报告修订号列「{{ t.revision_header }}」· {{ t.column_count }} 个指标列</p>
+    {% if columns.get(t.id) %}
+      <table>
+        <thead><tr><th>CSV 列名</th><th>对应指标</th><th>编码</th></tr></thead>
+        <tbody>
+        {% for c in columns[t.id] %}
+          <tr><td>{{ c.header }}</td><td>{{ c.name }}</td><td><code>{{ c.code }}</code></td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">该模板尚未登记指标列。</p>
+    {% endif %}
+  </section>
+{% else %}
+  <p class="muted">尚未登记模板。</p>
+{% endfor %}
+{% endblock %}

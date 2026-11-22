@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}试件查询 · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>试件查询</h1>
+<form method="get" action="{{ url_for('main.specimens') }}" class="inline">
+  <input name="q" value="{{ query }}" placeholder="试件号，支持部分匹配" maxlength="128">
+  <button type="submit">查询</button>
+</form>
+
+{% if specimens %}
+  <table>
+    <thead><tr><th>试件号</th><th>指标数</th><th>建档时间</th></tr></thead>
+    <tbody>
+    {% for s in specimens %}
+      <tr>
+        <td><a href="{{ url_for('main.specimen_detail', specimen_id=s.id) }}">{{ s.number }}</a></td>
+        <td>{{ s.indicator_count }}</td>
+        <td>{{ s.created_at | dt }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% elif query %}
+  <p class="muted">没有匹配「{{ query }}」的试件。</p>
+{% else %}
+  <p class="muted">还没有试件。</p>
+{% endif %}
+{% endblock %}

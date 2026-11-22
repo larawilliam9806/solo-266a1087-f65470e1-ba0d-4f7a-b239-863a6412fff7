@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="warn">{{ detail }}</p>
+
+<table class="conflicts">
+  <thead>
+    <tr><th>试件</th><th>指标</th><th>修订号</th><th>不同取值与来源</th></tr>
+  </thead>
+  <tbody>
+  {% for c in conflicts %}
+    <tr>
+      <td><strong>{{ c.specimen }}</strong></td>
+      <td>{{ c.indicator }}</td>
+      <td>{{ c.revision }}</td>
+      <td>
+        <ul class="plain">
+          {% for v in c.options %}
+            <li><strong class="value">{{ v.value }}</strong> MPa
+              <span class="muted">← {{ v.sources | join('；') }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<p><a class="button" href="{{ back_url }}">{{ back_label }}</a></p>
+{% endblock %}

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}试件 {{ specimen.number }} · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>试件 {{ specimen.number }}</h1>
+<p class="hint">每个指标显示底表现值（按修订号最高者取值）以及所有给出该值的同修订批次。</p>
+
+{% if not blocks %}
+  <p class="muted">该试件暂无任何申报。</p>
+{% endif %}
+
+{% for block in blocks %}
+  <section class="panel">
+    <h2>{{ block.indicator.name }} <span class="muted">（{{ block.indicator.code }}，{{ block.indicator.unit }}）</span></h2>
+    {% if block.current %}
+      <p class="current">
+        现值 <strong class="value">{{ block.current.value_micro | micro }}</strong> MPa
+        · 采用修订号 <strong>{{ block.current.revision_raw or block.current.revision }}</strong>
+        · 来源批次 <a href="{{ url_for('main.batch_detail', batch_id=block.current.source_batch_id) }}">#{{ block.current.source_batch_id }}</a>
+        「{{ block.current.filename }}」
+        （模板：{{ block.current.source_template_name or "—" }}）
+      </p>
+    {% else %}
+      <p class="muted">该指标目前没有底表值（所有申报均已撤下）。</p>
+    {% endif %}
+
+    <h3>同修订批次</h3>
+    <table>
+      <thead>
+        <tr><th>修订号</th><th>申报值 (MPa)</th><th>给出该值的批次</th><th>底表</th></tr>
+      </thead>
+      <tbody>
+      {% for g in block.groups %}
+        <tr class="{% if block.current and g.revision == block.current.revision and g.value_micro == block.current.value_micro %}is-current{% endif %}">
+          <td>{{ g.revision_raw or g.revision }}</td>
+          <td>{{ g.value }}</td>
+          <td>
+            <ul class="plain tight">
+              {% for b in g.batches %}
+                <li>
+                  <a href="{{ url_for('main.batch_detail', batch_id=b.id) }}">#{{ b.id }}</a>
+                  「{{ b.filename }}」
+                  {% if b.row_number %}第 {{ b.row_number }} 行{% endif %}
+                  <span class="muted">{{ b.uploaded_at | dt }} · 模板：{{ b.current_template_name or "—" }}
+                    {% if b.original_template_name and b.original_template_name != b.current_template_name %}
+                      （原为 {{ b.original_template_name }}）
+                    {% endif %}
+                  </span>
+                </li>
+              {% endfor %}
+            </ul>
+          </td>
+          <td>
+            {% if block.current and g.revision == block.current.revision and g.value_micro == block.current.value_micro %}
+              <span class="tag ok">采用中</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+{% endfor %}
+{% endblock %}

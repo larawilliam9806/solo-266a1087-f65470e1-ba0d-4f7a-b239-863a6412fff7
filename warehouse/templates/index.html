@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>概览</h1>
+<div class="stats">
+  <div class="stat"><span class="num">{{ stats.specimens }}</span><span>试件</span></div>
+  <div class="stat"><span class="num">{{ stats.batches }}</span><span>入仓批次</span></div>
+  <div class="stat"><span class="num">{{ stats.templates }}</span><span>报告模板</span></div>
+  <div class="stat"><span class="num">{{ stats.indicators }}</span><span>指标</span></div>
+</div>
+
+<section class="panel">
+  <h2>开始</h2>
+  <p>
+    <a class="button" href="{{ url_for('main.upload') }}">上传 CSV 申报</a>
+    <a class="button secondary" href="{{ url_for('main.specimens') }}">按试件查询现值</a>
+  </p>
+  {% if stats.templates == 0 or stats.indicators == 0 %}
+    <p class="hint">还没有登记模板或指标？先在
+      <a href="{{ url_for('main.indicators') }}">指标字典</a> 与
+      <a href="{{ url_for('main.templates') }}">报告模板</a> 中登记，
+      或运行 <code>flask --app warehouse seed-metadata</code> 写入示例元数据。
+    </p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>报告模板</h2>
+  {% if templates %}
+    <ul class="plain">
+      {% for t in templates %}
+        <li><strong>{{ t.name }}</strong>
+          <span class="muted">试件号列「{{ t.specimen_header }}」· 修订号列「{{ t.revision_header }}」· {{ t.column_count }} 个指标列</span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">尚未登记模板。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>最近批次</h2>
+  {% if batches %}
+    <table>
+      <thead><tr><th>批次</th><th>文件名</th><th>模板</th><th>申报数</th><th>上传时间</th></tr></thead>
+      <tbody>
+      {% for b in batches %}
+        <tr>
+          <td><a href="{{ url_for('main.batch_detail', batch_id=b.id) }}">#{{ b.id }}</a></td>
+          <td>{{ b.filename }}</td>
+          <td>{{ b.current_template_name }}
+            {% if b.template_id != b.original_template_id %}
+              <span class="tag">原为 {{ b.original_template_name }}</span>
+            {% endif %}
+          </td>
+          <td>{{ b.declaration_count }}</td>
+          <td>{{ b.uploaded_at | dt }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">还没有上传过批次。</p>
+  {% endif %}
+</section>
+{% endblock %}

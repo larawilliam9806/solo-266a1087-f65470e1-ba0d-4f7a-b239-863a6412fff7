@@ -1,0 +1,16 @@
+services:
+  warehouse:
+    build: .
+    image: concrete-warehouse:latest
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      DATABASE: /app/data/warehouse.db
+      SECRET_KEY: "${SECRET_KEY:-dev-only-change-me}"
+      AUTO_INIT_DB: "1"
+    volumes:
+      - warehouse-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  warehouse-data:
