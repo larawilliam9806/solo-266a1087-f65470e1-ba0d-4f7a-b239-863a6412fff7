@@ -553,8 +553,14 @@ def batch_switch(batch_id: int):
         return redirect(url_for("main.batch_detail", batch_id=batch_id))
 
     changes: list[dict[str, Any]] = []
+    parse_errors: list[str] = []
+    conflicts: list[dict[str, Any]] = []
     try:
         with write_transaction(conn):
+            # Re-interpret the original bytes with the new template.  The
+            # batch's own old declarations are excluded from conflict checking
+            # and replaced by the new parse, so the operation is checked
+            # against the corpus as it will look afterwards.
             parsed = core.parse_csv(
                 conn, new_template, batch["content"], allow_empty=True
             )
@@ -564,28 +570,19 @@ def batch_switch(batch_id: int):
                 subject_label=f"批次 #{batch_id}「{batch['filename']}」",
                 exclude_batch_id=batch_id,
             )
-            if conflicts:
-                raise Rejected(
-                    409,
-                    "conflict.html",
-                    {
-                        "title": "改选模板被拒绝：与既有申报存在同修订号不同值",
-                        "conflicts": conflicts,
-                        "back_url": url_for(
-                            "main.batch_detail", batch_id=batch_id
-                        ),
-                        "back_label": f"返回批次 #{batch_id}",
-                        "detail": f"批次 #{batch_id} 的模板未改动，"
-                        "原档与底表保持原状。",
-                    },
+            if not conflicts:
+                changes = core.switch_batch_template(
+                    conn,
+                    batch_id=batch_id,
+                    new_template_id=new_template_id,
+                    parsed=parsed,
                 )
-            changes = core.switch_batch_template(
-                conn,
-                batch_id=batch_id,
-                new_template_id=new_template_id,
-                parsed=parsed,
-            )
     except core.ParseError as exc:
+        parse_errors = [
+            f"无法按模板「{new_template['name']}」重新解释该文件：{issue}"
+            for issue in exc.issues
+        ]
+    if parse_errors:
         batch = _load_batch_or_404(conn, batch_id)
         return (
             render_template(
@@ -595,15 +592,24 @@ def batch_switch(batch_id: int):
                 changes=_batch_changes(conn, batch_id),
                 notes=_batch_notes(batch),
                 templates=_template_options(conn),
-                errors=[
-                    f"无法按模板「{new_template['name']}」重新解释该文件：{issue}"
-                    for issue in exc.issues
-                ],
+                errors=parse_errors,
             ),
             400,
         )
-    except Rejected as exc:
-        return render_template(exc.template, **exc.payload), exc.status
+    if conflicts:
+        return (
+            render_template(
+                "conflict.html",
+                title="改选模板被拒绝：同修订号出现不同值",
+                conflicts=conflicts,
+                back_url=url_for("main.batch_detail", batch_id=batch_id),
+                back_label=f"返回批次 #{batch_id}",
+                detail=f"批次 #{batch_id} 的模板未改动，"
+                "原档、申报与底表均保持原状。冲突覆盖本批的新申报与其它既有"
+                "申报，即使该修订号不是最高修订号也会列出；请核对后重试。",
+            ),
+            409,
+        )
 
     removed = sum(1 for c in changes if c["action"] == "removed")
     updated = sum(1 for c in changes if c["action"] == "set")

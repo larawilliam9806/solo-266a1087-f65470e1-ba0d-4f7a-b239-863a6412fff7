@@ -1,3 +1,8 @@
+import re
+import sqlite3
+
+import pytest
+
 from warehouse import core
 
 
@@ -416,3 +421,324 @@ def test_invalid_value_rejects_whole_upload(client, meta, db):
     assert "abc" in resp.get_data(as_text=True)
     assert db.execute("SELECT COUNT(*) FROM batches").fetchone()[0] == 0
     assert db.execute("SELECT COUNT(*) FROM specimens").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# template switch: batched conflict check / base recompute semantics
+# ---------------------------------------------------------------------------
+
+
+def _count_queries(conn, action):
+    """Run ``action`` and return (result, number of SQL statements executed)."""
+    executed: list[str] = []
+
+    def trace(statement):
+        executed.append(statement)
+
+    conn.set_trace_callback(trace)
+    try:
+        result = action()
+    finally:
+        conn.set_trace_callback(None)
+    return result, executed
+
+
+def _add_template(db, name, header, indicator_id):
+    cur = db.execute(
+        "INSERT INTO templates (name, specimen_header, revision_header, created_at)"
+        " VALUES (?, '试件编号', '修订号', ?)",
+        (name, core.now_iso()),
+    )
+    template_id = cur.lastrowid
+    db.execute(
+        "INSERT INTO template_columns (template_id, header, indicator_id)"
+        " VALUES (?, ?, ?)",
+        (template_id, header, indicator_id),
+    )
+    db.commit()
+    return template_id
+
+
+def test_switch_conflict_on_lower_revision_is_rejected(client, meta, db):
+    # Batch #1 declares revision 1 = 30.0 (highest for C-20).
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-20,1,30.0\n", "a.csv")
+    # Batch #2 is a converted-template file whose 强度 currently maps to the
+    # converted indicator, revision 1 = 26.0.
+    upload(client, meta["converted_tpl"], "试件编号,修订号,强度\nC-20,1,26.0\n", "b.csv")
+    # A revision-2 declaration from yet another batch makes revision 1 not the
+    # highest revision; the conflict must still be detected.
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-20,2,35.0\n", "c.csv")
+
+    before_batch = dict(db.execute("SELECT * FROM batches WHERE id = 2").fetchone())
+    before_decls = [
+        dict(r) for r in db.execute("SELECT * FROM declarations ORDER BY id").fetchall()
+    ]
+    before_base = [
+        dict(r) for r in db.execute("SELECT * FROM base_values ORDER BY specimen_id").fetchall()
+    ]
+
+    resp = client.post("/batches/2/switch", data={"template_id": str(meta["patch_tpl"])})
+    assert resp.status_code == 409
+    text = resp.get_data(as_text=True)
+    assert "C-20" in text
+    assert "30" in text and "26" in text
+    assert "a.csv" in text and "b.csv" in text  # both sources listed
+
+    assert dict(db.execute("SELECT * FROM batches WHERE id = 2").fetchone()) == before_batch
+    assert [
+        dict(r) for r in db.execute("SELECT * FROM declarations ORDER BY id").fetchall()
+    ] == before_decls
+    assert [
+        dict(r) for r in db.execute("SELECT * FROM base_values ORDER BY specimen_id").fetchall()
+    ] == before_base
+
+
+def test_switch_replaces_old_declarations_before_conflict_check(client, meta, db):
+    # The batch's own old declarations must not conflict with its new ones.
+    # Batch #1: 折算模板 revision 1 = 26.0 for C-21.  Batch #2 supplies 30.0
+    # for the measured indicator, revision 1.
+    upload(client, meta["converted_tpl"], "试件编号,修订号,强度\nC-21,1,26.0\n", "a.csv")
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-21,1,30.0\n", "b.csv")
+
+    # Switching batch #1 to the measured template yields 26.0 for the measured
+    # indicator at revision 1, which collides with batch #2 -> rejected.
+    resp = client.post("/batches/1/switch", data={"template_id": str(meta["patch_tpl"])})
+    assert resp.status_code == 409
+    assert "26" in resp.get_data(as_text=True)
+    assert "30" in resp.get_data(as_text=True)
+
+    # Switching the same batch to a template that maps 强度 to the measured
+    # indicator must collide too, and its own old (converted) declarations are
+    # replaced rather than compared against themselves.
+    resp = client.post("/batches/1/switch", data={"template_id": str(meta["measured_tpl"])})
+    assert resp.status_code == 409
+    assert db.execute(
+        "SELECT COUNT(*) FROM declarations WHERE batch_id = 1 AND indicator_id = ?",
+        (meta["converted"],),
+    ).fetchone()[0] == 1
+
+
+def test_switch_recomputes_only_affected_specimens_and_indicators(client, meta, db):
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-30,1,30.0\n", "a.csv")
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-31,1,31.0\n", "b.csv")
+    # An unrelated specimen with a split-tensile value only.
+    upload(client, meta["measured_tpl"], "试件编号,修订号,劈裂\nC-32,1,2.5\n", "c.csv")
+
+    untouched_before = dict(
+        db.execute(
+            """
+            SELECT bv.* FROM base_values bv JOIN specimens s ON s.id = bv.specimen_id
+            WHERE s.number = 'C-31' AND bv.indicator_id = ?
+            """,
+            (meta["measured"],),
+        ).fetchone()
+    )
+    split_before = dict(
+        db.execute(
+            """
+            SELECT bv.* FROM base_values bv JOIN specimens s ON s.id = bv.specimen_id
+            WHERE s.number = 'C-32' AND bv.indicator_id = ?
+            """,
+            (meta["split"],),
+        ).fetchone()
+    )
+
+    # Switch batch #1 to a template that no longer matches any column, so it
+    # stops declaring measured strength for C-30 only.
+    other = _add_template(db, "无匹配", "别列", meta["split"])
+    resp = client.post("/batches/1/switch", data={"template_id": str(other)})
+    assert resp.status_code == 302
+
+    assert base(db, "C-30", meta["measured"]) is None
+    # C-31 and C-32 rows are untouched -- byte-for-byte, including timestamps.
+    assert dict(
+        db.execute(
+            """
+            SELECT bv.* FROM base_values bv JOIN specimens s ON s.id = bv.specimen_id
+            WHERE s.number = 'C-31' AND bv.indicator_id = ?
+            """,
+            (meta["measured"],),
+        ).fetchone()
+    ) == untouched_before
+    assert dict(
+        db.execute(
+            """
+            SELECT bv.* FROM base_values bv JOIN specimens s ON s.id = bv.specimen_id
+            WHERE s.number = 'C-32' AND bv.indicator_id = ?
+            """,
+            (meta["split"],),
+        ).fetchone()
+    ) == split_before
+
+
+def test_switch_updates_base_when_only_source_batch_changes(client, meta, db):
+    # Two batches corroborate revision 1 = 30.0 for C-33; the later upload is
+    # the base source.
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-33,1,30.0\n", "a.csv")
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-33,1,30.0\n", "b.csv")
+    assert base(db, "C-33", meta["measured"])["batch_id"] == 2
+
+    before_updated_at = base(db, "C-33", meta["measured"])["updated_at"]
+
+    # Switch batch #2 away (no matching columns): batch #1 still supplies the
+    # same value and revision, but the source batch changes.
+    other = _add_template(db, "无匹配2", "别列", meta["split"])
+    assert client.post("/batches/2/switch", data={"template_id": str(other)}).status_code == 302
+
+    row = base(db, "C-33", meta["measured"])
+    assert row["batch_id"] == 1
+    assert row["value_micro"] == 30000
+    assert row["revision"] == 1
+    assert row["updated_at"] > before_updated_at
+
+
+def test_switch_does_not_rewrite_unchanged_base_rows(client, meta, db):
+    # A batch carrying 强度 + 劈裂, and a later patch corroborating 强度 at the
+    # same revision, so the patch batch is the base source for 强度.
+    upload(client, meta["measured_tpl"], "试件编号,修订号,强度,劈裂\nC-34,1,30.0,2.5\n", "a.csv")
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-34,1,30.0\n", "b.csv")
+    # An independent specimen, untouched by the switch below.
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\nC-35,1,40.0\n", "c.csv")
+
+    before = {
+        (r["specimen_id"], r["indicator_id"]): dict(r)
+        for r in db.execute("SELECT * FROM base_values").fetchall()
+    }
+    # Both templates map 强度 to the measured indicator, so switching batch #2
+    # re-parses to the exact same declarations.  Both of C-34's pairs are
+    # recomputed, but neither value, revision nor source changes, so no row may
+    # be rewritten (timestamps included).
+    assert client.post(
+        "/batches/2/switch", data={"template_id": str(meta["patch_tpl"])}
+    ).status_code == 302
+
+    after = {
+        (r["specimen_id"], r["indicator_id"]): dict(r)
+        for r in db.execute("SELECT * FROM base_values").fetchall()
+    }
+    assert set(after) == set(before)
+    for key, row in after.items():
+        assert row == before[key], f"row {key} was rewritten without a content change"
+
+
+def test_switch_scales_batchwise_without_per_key_queries(client, meta, db):
+    # 40 specimens x 2 indicators, so any per-key lookup would show up.
+    rows = "".join(
+        f"C-{100 + i},1,{30 + i * 0.1:.1f},2.5\n" for i in range(40)
+    )
+    upload(client, meta["measured_tpl"], "试件编号,修订号,强度,劈裂\n" + rows)
+
+    _, statements = _count_queries(
+        db,
+        lambda: client.post(
+            "/batches/1/switch", data={"template_id": str(meta["patch_tpl"])}
+        ),
+    )
+    # 80 specimen/indicator pairs are recomputed; the statement count must stay
+    # flat instead of growing with each pair.  The fixed overhead is roughly a
+    # dozen conflict-check statements plus a dozen recompute statements.
+    assert len(statements) < 50, f"{len(statements)} statements: {statements}"
+    # And nothing may issue one statement per pair.
+    assert len(statements) < len(rows.splitlines()) * 2
+
+
+def test_switch_does_not_scan_unrelated_declarations(client, meta, db):
+    # A lot of noise for other specimens.
+    noise = "".join(f"D-{i},1,{20 + i * 0.5:.1f}\n" for i in range(300))
+    upload(client, meta["patch_tpl"], "试件编号,修订号,强度\n" + noise, "noise.csv")
+    upload(client, meta["converted_tpl"], "试件编号,修订号,强度\nC-40,1,28.0\n", "target.csv")
+    db.commit()
+
+    statements = _capture_switch_queries(client, db, 2, meta["patch_tpl"])
+    unconstrained = [
+        q
+        for q in statements
+        if "FROM declarations" in q and "temp._" not in q and "WHERE" not in q
+    ]
+    assert not unconstrained, unconstrained
+
+    # And every declaration / base-table read must use an index rather than a
+    # full scan, so unrelated rows are never visited.
+    _replay_staged_keys(db, statements)
+    scanned = []
+    for q in statements:
+        if "FROM declarations" not in q and "FROM base_values" not in q:
+            continue
+        plan = [row[3] for row in db.execute("EXPLAIN QUERY PLAN " + q)]
+        # Scans of the operation's own co-routines / temp keys are fine; a scan
+        # of the real declaration or base table is not.
+        table_scans = [
+            line
+            for line in plan
+            if re.match(
+                r"SCAN (?:[a-zA-Z_]+|SQLITE_)", line
+            )
+            and "SUBQUERY" not in line.upper()
+        ]
+        if table_scans:
+            scanned.append((q, plan))
+    assert not scanned, scanned
+
+
+def _replay_staged_keys(db, statements):
+    """Recreate the operation's temp tables so captured SQL can be EXPLAINed."""
+    for statement in statements:
+        head = statement.lstrip().upper()
+        if head.startswith(("CREATE TEMP TABLE", "INSERT INTO TEMP.")):
+            db.execute(statement)
+
+
+def _capture_switch_queries(client, db, batch_id, template_id):
+    statements: list[str] = []
+
+    def capturing_trace(statement):
+        statements.append(statement)
+
+    db.set_trace_callback(capturing_trace)
+    try:
+        resp = client.post(
+            f"/batches/{batch_id}/switch", data={"template_id": str(template_id)}
+        )
+    finally:
+        db.set_trace_callback(None)
+    assert resp.status_code == 302
+    return statements
+
+
+def test_switch_write_failure_rolls_everything_back(client, meta, db, monkeypatch):
+    upload(client, meta["converted_tpl"], "试件编号,修订号,强度\nC-50,1,28.0\n", "a.csv")
+    upload(client, meta["converted_tpl"], "试件编号,修订号,强度\nC-50,1,28.0\n", "b.csv")
+    db.commit()
+
+    before = {
+        "batch": dict(db.execute("SELECT * FROM batches WHERE id = 2").fetchone()),
+        "declarations": [
+            dict(r) for r in db.execute("SELECT * FROM declarations ORDER BY id").fetchall()
+        ],
+        "base": [
+            dict(r) for r in db.execute("SELECT * FROM base_values ORDER BY specimen_id").fetchall()
+        ],
+        "changes": db.execute("SELECT COUNT(*) FROM batch_template_changes").fetchone()[0],
+    }
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(core, "recompute_base", boom)
+    with pytest.raises(sqlite3.OperationalError):
+        client.post(
+            "/batches/2/switch",
+            data={"template_id": str(meta["measured_tpl"])},
+        )
+
+    assert dict(db.execute("SELECT * FROM batches WHERE id = 2").fetchone()) == before["batch"]
+    assert [
+        dict(r) for r in db.execute("SELECT * FROM declarations ORDER BY id").fetchall()
+    ] == before["declarations"]
+    assert [
+        dict(r) for r in db.execute("SELECT * FROM base_values ORDER BY specimen_id").fetchall()
+    ] == before["base"]
+    assert (
+        db.execute("SELECT COUNT(*) FROM batch_template_changes").fetchone()[0]
+        == before["changes"]
+    )

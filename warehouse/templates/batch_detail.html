@@ -38,8 +38,10 @@
 <section class="panel">
   <h2>改选模板</h2>
   <p class="hint">若本批次上传时选错了模板，可在此改选。系统会用新模板重新解释原件：
-    原先按旧模板得到的申报被替换；失去所有申报的指标会从底表撤下。
-    若改选后与其它批次在同一试件、指标、修订号上出现不同值，改选会被整体拒绝。</p>
+    本批的新申报替代本批的旧申报；失去所有申报的指标会从底表撤下或回落到更低修订号的申报。
+    底表只重算本批改选前后涉及的试件与指标，内容未变的行保持不动。
+    若改选后与其它批次在同一试件、指标、修订号上出现不同值（无论该修订号是否为最高），
+    改选会被整体拒绝，模板、申报与底表均保持原状。</p>
   <form method="post" action="{{ url_for('main.batch_switch', batch_id=batch.id) }}" class="inline">
     <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
     <select name="template_id" required>

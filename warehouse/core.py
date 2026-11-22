@@ -353,6 +353,62 @@ def parse_csv(
 
 
 # ---------------------------------------------------------------------------
+# batched lookups
+# ---------------------------------------------------------------------------
+
+def _executemany_batched(
+    conn: sqlite3.Connection, sql: str, row_placeholders: str, payload: Sequence[Sequence[Any]]
+) -> None:
+    """Execute ``INSERT ... VALUES (..),(..),...`` a chunk at a time."""
+    if not payload:
+        return
+    columns = max(1, len(payload[0]))
+    chunk = max(1, 900 // columns)
+    for start in range(0, len(payload), chunk):
+        batch = payload[start : start + chunk]
+        statement = sql + " VALUES " + ", ".join(row_placeholders for _ in batch)
+        conn.execute(statement, [value for row in batch for value in row])
+
+
+def _stage_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: Sequence[tuple[str, str]],
+    rows: Iterable[Sequence[Any]],
+    *,
+    primary_key: Sequence[str] = (),
+) -> None:
+    """Create a temp table holding the keys/values of one bulk operation.
+
+    Joining the operation's own keys as a set keeps every downstream query a
+    bounded index lookup instead of a per-key round trip or a full scan of
+    unrelated declarations.  The table is dropped by :func:`_drop_staged`
+    once the operation is done.
+    """
+    conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+    definitions = ", ".join(f"{name} {decl}" for name, decl in columns)
+    if primary_key:
+        definitions += ", PRIMARY KEY (" + ", ".join(primary_key) + ")"
+    suffix = " WITHOUT ROWID" if primary_key else ""
+    conn.execute(f"CREATE TEMP TABLE temp.{table} ({definitions}){suffix}")
+    column_sql = ", ".join(name for name, _ in columns)
+    placeholders = "(" + ", ".join("?" for _ in columns) + ")"
+    # Multi-row VALUES keeps the statement count flat regardless of how many
+    # keys the operation touches.
+    _executemany_batched(
+        conn,
+        f"INSERT INTO temp.{table} ({column_sql})",
+        placeholders,
+        list(rows),
+    )
+
+
+def _drop_staged(conn: sqlite3.Connection, *tables: str) -> None:
+    for table in tables:
+        conn.execute(f"DROP TABLE IF EXISTS temp.{table}")
+
+
+# ---------------------------------------------------------------------------
 # conflict detection
 # ---------------------------------------------------------------------------
 
@@ -373,27 +429,117 @@ def find_conflicts(
     A conflict exists when the same (specimen, indicator, revision) key would
     hold two different values after the operation.  Identical values from
     several batches are allowed (they are merely corroborating declarations).
+    Every revision is checked, not only the highest one.
+
+    ``exclude_batch_id`` removes that batch's *old* declarations from the
+    comparison, so a template switch is checked against the corpus with the
+    batch's new declarations substituted for its old ones.
+
+    All lookups are batched: the keys of the operation are staged in a temp
+    table and joined against the declaration index, so the cost does not grow
+    with one query per key and declarations outside the operation are never
+    scanned.
     """
+    if not rows:
+        return []
+
     grouped: dict[tuple[str, int, int], list[ParsedRow]] = {}
     for row in rows:
         grouped.setdefault(_conflict_key(row), []).append(row)
 
-    specimen_ids = {}
+    staged = ("_conflict_specimens", "_conflict_indicators", "_conflict_keys")
+    try:
+        return _find_conflicts_staged(
+            conn,
+            grouped,
+            subject_label=subject_label,
+            exclude_batch_id=exclude_batch_id,
+        )
+    finally:
+        _drop_staged(conn, *staged)
+
+
+def _find_conflicts_staged(
+    conn: sqlite3.Connection,
+    grouped: dict[tuple[str, int, int], list[ParsedRow]],
+    *,
+    subject_label: str,
+    exclude_batch_id: int | None,
+) -> list[dict[str, Any]]:
     numbers = sorted({key[0] for key in grouped})
-    if numbers:
-        placeholders = ",".join("?" for _ in numbers)
+    _stage_rows(conn, "_conflict_specimens", (("number", "TEXT"),), [(n,) for n in numbers])
+    specimen_ids = {
+        fetched["number"]: fetched["id"]
         for fetched in conn.execute(
-            f"SELECT id, number FROM specimens WHERE number IN ({placeholders})",
-            numbers,
+            "SELECT s.id, s.number FROM specimens s"
+            " JOIN temp._conflict_specimens t ON t.number = s.number"
+        )
+    }
+
+    indicator_ids = sorted({key[1] for key in grouped})
+    _stage_rows(
+        conn, "_conflict_indicators", (("id", "INTEGER"),), [(i,) for i in indicator_ids]
+    )
+    indicators = {
+        fetched["id"]: fetched
+        for fetched in conn.execute(
+            "SELECT i.id, i.code, i.name, i.unit FROM indicators i"
+            " JOIN temp._conflict_indicators t ON t.id = i.id"
+        )
+    }
+
+    # Only keys whose specimen already exists can have stored declarations.
+    existing: dict[tuple[int, int, int], list[tuple[int, str]]] = {}
+    key_rows = sorted(
+        {
+            (specimen_ids[number], indicator_id, revision)
+            for (number, indicator_id, revision) in grouped
+            if number in specimen_ids
+        }
+    )
+    if key_rows:
+        _stage_rows(
+            conn,
+            "_conflict_keys",
+            (
+                ("specimen_id", "INTEGER"),
+                ("indicator_id", "INTEGER"),
+                ("revision", "INTEGER"),
+            ),
+            key_rows,
+            primary_key=("specimen_id", "indicator_id", "revision"),
+        )
+        extra = ""
+        params: list[Any] = []
+        if exclude_batch_id is not None:
+            extra = " AND d.batch_id != ?"
+            params.append(exclude_batch_id)
+        for stored in conn.execute(
+            f"""
+            SELECT d.specimen_id, d.indicator_id, d.revision, d.value_micro,
+                   d.row_number, b.id AS batch_id, b.filename
+            FROM declarations d
+            JOIN batches b ON b.id = d.batch_id
+            WHERE (d.specimen_id, d.indicator_id, d.revision) IN (
+                SELECT specimen_id, indicator_id, revision FROM temp._conflict_keys
+            ){extra}
+            """,
+            params,
         ):
-            specimen_ids[fetched["number"]] = fetched["id"]
+            label = f"批次 #{stored['batch_id']}「{stored['filename']}」"
+            if stored["row_number"]:
+                label += f" 第 {stored['row_number']} 行"
+            existing.setdefault(
+                (stored["specimen_id"], stored["indicator_id"], stored["revision"]),
+                [],
+            ).append((stored["value_micro"], label))
 
     conflicts: list[dict[str, Any]] = []
     for (number, indicator_id, revision), group in grouped.items():
-        indicator = conn.execute(
-            "SELECT code, name, unit FROM indicators WHERE id = ?", (indicator_id,)
-        ).fetchone()
-        indicator_label = f"{indicator['name']}（{indicator['code']}）"
+        indicator = indicators.get(indicator_id)
+        indicator_code = indicator["code"] if indicator else f"#{indicator_id}"
+        indicator_name = indicator["name"] if indicator else indicator_code
+        indicator_label = f"{indicator_name}（{indicator_code}）"
 
         entries: dict[int, list[str]] = {}
         for row in group:
@@ -403,31 +549,17 @@ def find_conflicts(
 
         specimen_id = specimen_ids.get(number)
         if specimen_id is not None:
-            params: list[Any] = [specimen_id, indicator_id, revision]
-            extra = ""
-            if exclude_batch_id is not None:
-                extra = " AND d.batch_id != ?"
-                params.append(exclude_batch_id)
-            for existing in conn.execute(
-                f"""
-                SELECT d.value_micro, d.row_number, b.id AS batch_id, b.filename
-                FROM declarations d
-                JOIN batches b ON b.id = d.batch_id
-                WHERE d.specimen_id = ? AND d.indicator_id = ? AND d.revision = ?{extra}
-                """,
-                params,
+            for value_micro, label in existing.get(
+                (specimen_id, indicator_id, revision), ()
             ):
-                label = f"批次 #{existing['batch_id']}「{existing['filename']}」"
-                if existing["row_number"]:
-                    label += f" 第 {existing['row_number']} 行"
-                entries.setdefault(existing["value_micro"], []).append(label)
+                entries.setdefault(value_micro, []).append(label)
 
         if len(entries) > 1:
             conflicts.append(
                 {
                     "specimen": number,
                     "indicator": indicator_label,
-                    "indicator_code": indicator["code"],
+                    "indicator_code": indicator_code,
                     "revision": group[0].revision_raw
                     if group[0].revision_raw.strip()
                     else str(revision),
@@ -451,17 +583,51 @@ def find_conflicts(
 # ---------------------------------------------------------------------------
 
 
-def ensure_specimen(conn: sqlite3.Connection, number: str) -> int:
-    row = conn.execute(
-        "SELECT id FROM specimens WHERE number = ?", (number,)
-    ).fetchone()
-    if row:
-        return row["id"]
-    cursor = conn.execute(
-        "INSERT INTO specimens (number, created_at) VALUES (?, ?)",
-        (number, now_iso()),
+def ensure_specimens(
+    conn: sqlite3.Connection, numbers: Iterable[str]
+) -> dict[str, int]:
+    """Resolve specimen numbers to ids, creating the missing ones in bulk."""
+    unique = sorted(set(numbers))
+    if not unique:
+        return {}
+    try:
+        _stage_rows(
+            conn, "_specimen_numbers", (("number", "TEXT"),), [(n,) for n in unique]
+        )
+        return _ensure_specimens_staged(conn)
+    finally:
+        _drop_staged(conn, "_specimen_numbers")
+
+
+def _ensure_specimens_staged(conn: sqlite3.Connection) -> dict[str, int]:
+    _specimen_id_query = (
+        "SELECT s.id, s.number FROM specimens s"
+        " JOIN temp._specimen_numbers t ON t.number = s.number"
     )
-    return int(cursor.lastrowid)
+    ids = {
+        row["number"]: row["id"] for row in conn.execute(_specimen_id_query)
+    }
+    missing = [
+        row["number"]
+        for row in conn.execute(
+            "SELECT t.number FROM temp._specimen_numbers t"
+            " WHERE NOT EXISTS ("
+            "   SELECT 1 FROM specimens s WHERE s.number = t.number"
+            " )"
+        )
+    ]
+    if missing:
+        timestamp = now_iso()
+        _executemany_batched(
+            conn,
+            "INSERT INTO specimens (number, created_at)",
+            "(?, ?)",
+            [(number, timestamp) for number in missing],
+        )
+        ids.update(
+            {row["number"]: row["id"] for row in conn.execute(_specimen_id_query)}
+        )
+    return ids
 
 
 def insert_declarations(
@@ -470,23 +636,24 @@ def insert_declarations(
     """Insert rows, de-duplicating identical keys inside the batch.
 
     Returns the set of (specimen_id, indicator_id) pairs the batch declares.
+    Specimens and declaration rows are resolved and written in bulk.
     """
+    parsed_rows = list(rows)
+    specimen_ids = ensure_specimens(
+        conn, (row.specimen_number for row in parsed_rows)
+    )
     pairs: set[tuple[int, int]] = set()
-    seen: dict[tuple[int, int, int], int] = {}
-    for row in rows:
-        specimen_id = ensure_specimen(conn, row.specimen_number)
+    seen: set[tuple[int, int, int]] = set()
+    payload: list[tuple[Any, ...]] = []
+    for row in parsed_rows:
+        specimen_id = specimen_ids[row.specimen_number]
         key = (specimen_id, row.indicator_id, row.revision)
         pairs.add((specimen_id, row.indicator_id))
         if key in seen:
             # Identical value: already validated as non-conflicting.
             continue
-        conn.execute(
-            """
-            INSERT INTO declarations
-                (batch_id, specimen_id, indicator_id, revision, revision_raw,
-                 value_micro, row_number)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+        seen.add(key)
+        payload.append(
             (
                 batch_id,
                 specimen_id,
@@ -495,9 +662,19 @@ def insert_declarations(
                 row.revision_raw,
                 row.value_micro,
                 row.line,
-            ),
+            )
         )
-        seen[key] = row.value_micro
+    if payload:
+        _executemany_batched(
+            conn,
+            """
+            INSERT INTO declarations
+                (batch_id, specimen_id, indicator_id, revision, revision_raw,
+                 value_micro, row_number)
+            """,
+            "(?, ?, ?, ?, ?, ?, ?)",
+            payload,
+        )
     return pairs
 
 
@@ -519,87 +696,214 @@ def recompute_base(
     Highest revision wins.  A tie on the revision number is resolved by the
     latest upload (values are guaranteed to agree by conflict detection).
     Pairs with no remaining declaration are removed from the base table.
+
+    Only the supplied pairs are touched.  Old rows, winning declarations and
+    descriptive labels are fetched for the whole set in a handful of batched
+    index lookups; writes are one ``DELETE`` plus one UPSERT for the entire
+    set.  A row whose stored content (revision, revision text, value, source
+    batch) is already correct is left untouched -- including its timestamp --
+    while a changed source batch alone is still written.
     """
-    changes: list[dict[str, Any]] = []
-    for specimen_id, indicator_id in sorted(set(pairs)):
-        old = conn.execute(
-            "SELECT * FROM base_values WHERE specimen_id = ? AND indicator_id = ?",
-            (specimen_id, indicator_id),
-        ).fetchone()
-        winner = conn.execute(
+    pair_set = sorted(set(pairs))
+    if not pair_set:
+        return []
+    try:
+        return _recompute_base_staged(conn, pair_set)
+    finally:
+        _drop_staged(
+            conn,
+            "_recompute_pairs",
+            "_base_removals",
+            "_base_upserts",
+            "_base_labels",
+        )
+
+
+_BASE_CONTENT_COLUMNS = ("revision", "revision_raw", "value_micro", "batch_id")
+
+
+def _base_content(row: sqlite3.Row) -> tuple[Any, ...]:
+    return tuple(row[column] for column in _BASE_CONTENT_COLUMNS)
+
+
+def _recompute_base_staged(
+    conn: sqlite3.Connection, pair_set: Sequence[tuple[int, int]]
+) -> list[dict[str, Any]]:
+    _stage_rows(
+        conn,
+        "_recompute_pairs",
+        (("specimen_id", "INTEGER"), ("indicator_id", "INTEGER")),
+        pair_set,
+        primary_key=("specimen_id", "indicator_id"),
+    )
+    old_rows = {
+        (row["specimen_id"], row["indicator_id"]): row
+        for row in conn.execute(
             """
-            SELECT d.*, b.uploaded_at
+            SELECT bv.* FROM base_values bv
+            WHERE (bv.specimen_id, bv.indicator_id) IN (
+                SELECT specimen_id, indicator_id FROM temp._recompute_pairs
+            )
+            """
+        )
+    }
+
+    winner_rows: dict[tuple[int, int], sqlite3.Row] = {}
+    for row in conn.execute(
+        """
+        SELECT * FROM (
+            SELECT d.specimen_id, d.indicator_id, d.revision, d.revision_raw,
+                   d.value_micro, d.batch_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY d.specimen_id, d.indicator_id
+                       ORDER BY d.revision DESC, b.uploaded_at DESC,
+                                b.id DESC, d.id DESC
+                   ) AS rn
             FROM declarations d
             JOIN batches b ON b.id = d.batch_id
-            WHERE d.specimen_id = ? AND d.indicator_id = ?
-            ORDER BY d.revision DESC, b.uploaded_at DESC, b.id DESC, d.id DESC
-            LIMIT 1
-            """,
-            (specimen_id, indicator_id),
-        ).fetchone()
-        specimen = conn.execute(
-            "SELECT number FROM specimens WHERE id = ?", (specimen_id,)
-        ).fetchone()
-        indicator = conn.execute(
-            "SELECT code, name FROM indicators WHERE id = ?", (indicator_id,)
-        ).fetchone()
+            WHERE (d.specimen_id, d.indicator_id) IN (
+                SELECT specimen_id, indicator_id FROM temp._recompute_pairs
+            )
+        )
+        WHERE rn = 1
+        """
+    ):
+        winner_rows[(row["specimen_id"], row["indicator_id"])] = row
 
+    removals = [
+        key
+        for key in pair_set
+        if key not in winner_rows and key in old_rows
+    ]
+    if removals:
+        _stage_rows(
+            conn,
+            "_base_removals",
+            (("specimen_id", "INTEGER"), ("indicator_id", "INTEGER")),
+            removals,
+            primary_key=("specimen_id", "indicator_id"),
+        )
+        conn.execute(
+            """
+            DELETE FROM base_values
+            WHERE (specimen_id, indicator_id) IN (
+                SELECT specimen_id, indicator_id FROM temp._base_removals
+            )
+            """
+        )
+
+    timestamp = now_iso()
+    upserts: list[tuple[Any, ...]] = []
+    for key in pair_set:
+        winner = winner_rows.get(key)
         if winner is None:
-            if old is not None:
-                conn.execute(
-                    "DELETE FROM base_values WHERE specimen_id = ? AND indicator_id = ?",
-                    (specimen_id, indicator_id),
-                )
-                changes.append(
-                    {
-                        "action": "removed",
-                        "specimen": specimen["number"],
-                        "indicator": f"{indicator['name']}（{indicator['code']}）",
-                        "old": format_micro(old["value_micro"]),
-                        "new": None,
-                        "revision": old["revision_raw"],
-                    }
-                )
             continue
-
+        old = old_rows.get(key)
+        if old is not None and _base_content(old) == _base_content(winner):
+            continue
+        upserts.append(
+            (
+                winner["specimen_id"],
+                winner["indicator_id"],
+                winner["revision"],
+                winner["revision_raw"],
+                winner["value_micro"],
+                winner["batch_id"],
+                timestamp,
+            )
+        )
+    if upserts:
+        _stage_rows(
+            conn,
+            "_base_upserts",
+            (
+                ("specimen_id", "INTEGER"),
+                ("indicator_id", "INTEGER"),
+                ("revision", "INTEGER"),
+                ("revision_raw", "TEXT"),
+                ("value_micro", "INTEGER"),
+                ("batch_id", "INTEGER"),
+                ("updated_at", "TEXT"),
+            ),
+            upserts,
+            primary_key=("specimen_id", "indicator_id"),
+        )
         conn.execute(
             """
             INSERT INTO base_values
                 (specimen_id, indicator_id, revision, revision_raw, value_micro,
                  batch_id, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            SELECT specimen_id, indicator_id, revision, revision_raw, value_micro,
+                   batch_id, updated_at
+            FROM temp._base_upserts
+            WHERE true
             ON CONFLICT (specimen_id, indicator_id) DO UPDATE SET
                 revision = excluded.revision,
                 revision_raw = excluded.revision_raw,
                 value_micro = excluded.value_micro,
                 batch_id = excluded.batch_id,
                 updated_at = excluded.updated_at
-            """,
-            (
-                specimen_id,
-                indicator_id,
-                winner["revision"],
-                winner["revision_raw"],
-                winner["value_micro"],
-                winner["batch_id"],
-                now_iso(),
-            ),
+            """
         )
-        if old is None or (
-            old["value_micro"] != winner["value_micro"]
-            or old["revision"] != winner["revision"]
-            or old["batch_id"] != winner["batch_id"]
-        ):
+
+    changed_keys = removals + [
+        (row[0], row[1]) for row in upserts
+    ]
+    labels: dict[tuple[int, int], tuple[str, str]] = {}
+    if changed_keys:
+        _stage_rows(
+            conn,
+            "_base_labels",
+            (("specimen_id", "INTEGER"), ("indicator_id", "INTEGER")),
+            changed_keys,
+            primary_key=("specimen_id", "indicator_id"),
+        )
+        labels = {
+            (row["specimen_id"], row["indicator_id"]): (
+                row["number"],
+                f"{row['name']}（{row['code']}）",
+            )
+            for row in conn.execute(
+                """
+                SELECT p.specimen_id, p.indicator_id, s.number, i.code, i.name
+                FROM temp._base_labels p
+                JOIN specimens s ON s.id = p.specimen_id
+                JOIN indicators i ON i.id = p.indicator_id
+                """
+            )
+        }
+
+    changes: list[dict[str, Any]] = []
+    for key in pair_set:
+        specimen_number, indicator_label = labels.get(key, (None, None))
+        old = old_rows.get(key)
+        if key in removals:
             changes.append(
                 {
-                    "action": "set",
-                    "specimen": specimen["number"],
-                    "indicator": f"{indicator['name']}（{indicator['code']}）",
-                    "old": format_micro(old["value_micro"]) if old else None,
-                    "new": format_micro(winner["value_micro"]),
-                    "revision": winner["revision_raw"],
+                    "action": "removed",
+                    "specimen": specimen_number,
+                    "indicator": indicator_label,
+                    "old": format_micro(old["value_micro"]),
+                    "new": None,
+                    "revision": old["revision_raw"],
                 }
             )
+            continue
+        winner = winner_rows.get(key)
+        if winner is None:
+            continue
+        if old is not None and _base_content(old) == _base_content(winner):
+            continue
+        changes.append(
+            {
+                "action": "set",
+                "specimen": specimen_number,
+                "indicator": indicator_label,
+                "old": format_micro(old["value_micro"]) if old else None,
+                "new": format_micro(winner["value_micro"]),
+                "revision": winner["revision_raw"],
+            }
+        )
     return changes
 
 
